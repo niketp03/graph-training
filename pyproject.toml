@@ -1,0 +1,17 @@
+[project]
+name = "graph-training"
+version = "0.1.0"
+description = "Next-token prediction on graph trajectories using Qwen2 architecture"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0.0",
+    "lightning>=2.0.0",
+    "transformers>=4.40.0",
+    "tokenizers>=0.15.0",
+    "networkx>=3.0",
+    "hydra-core>=1.3.0",
+    "omegaconf>=2.3.0",
+    "wandb>=0.15.0",
+    "numpy>=1.24.0",
+]

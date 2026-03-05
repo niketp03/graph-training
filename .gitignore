@@ -1,0 +1,28 @@
+# Checkpoints & model artifacts
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+
+# Data outputs
+data_output/
+data_output_large/
+
+# Wandb
+wandb/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Logs
+*.log
+nohup.out
+
+# Environment
+.env
+*.env
