@@ -22,6 +22,9 @@ Override defaults via Hydra CLI:
 
 ```bash
 python generate.py data.num_nodes=200 data.edge_probability=0.15 data.num_trajectories=20000 data.max_path_length=30 data.output_dir=./my_data
+
+# Generate a directed graph
+python generate.py data.directed=true data.num_nodes=200 data.edge_probability=0.15 data.output_dir=./my_directed_data
 ```
 
 This produces in the output directory:
@@ -47,7 +50,7 @@ Training uses Weights & Biases for logging. Set `WANDB_API_KEY` or run `wandb lo
 
 All parameters are managed via Hydra. See `conf/config.yaml` for defaults. Sections:
 
-- **data** — graph size, edge probability, trajectory count, path length, splits, seed
+- **data** — graph size, edge probability, directed/undirected, trajectory count, path length, splits, seed
 - **model** — Qwen2 architecture params (hidden size, layers, heads, etc.)
 - **train** — learning rate, batch size, epochs, gradient clipping, precision, W&B settings
 

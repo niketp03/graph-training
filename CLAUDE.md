@@ -5,9 +5,9 @@ Build a Python project with two main components: a data generation script and a 
 This script generates synthetic training data from random graphs.
 
 **Graph generation:**
-- Sample a large Erdos-Renyi random graph (configurable number of nodes and edge probability/density). Prune the graph to keep only the largest connected component. 
-- Save the entire graph structure as a JSON file (e.g., `graph.json`) with nodes and adjacency info.
-- Graph structure in the JSON file should have nodes and then for each node a list of all the other nodes it is connected to. 
+- Sample a large Erdos-Renyi random graph (configurable number of nodes and edge probability/density). Supports both directed and undirected graphs via a `directed` config flag. For undirected graphs, prune to the largest connected component. For directed graphs, prune to the largest weakly connected component (connected when edge direction is ignored). This means some nodes may be dead ends with no outgoing edges.
+- Save the entire graph structure as a JSON file (e.g., `graph.json`) with nodes, adjacency info, and a `directed` boolean flag.
+- Graph structure in the JSON file should have nodes and then for each node a list of all the other nodes it is connected to (successors for directed graphs, neighbors for undirected). 
 
 **Trajectory generation:**
 - Generate a configurable number of trajectories of configurable max length.
@@ -21,7 +21,7 @@ This script generates synthetic training data from random graphs.
 **Vocabulary generation:**
 - Produce a `vocabulary.json` file listing all vocabulary items: the node names/IDs plus special tokens (`<start_goal>`, `<end_goal>`, `<pad>`, `<eos>`, etc.).
 
-**CLI args for generate.py:** number of nodes, edge probability, number of trajectories, max trajectory length, train/val/test split ratios, output directory, random seed.
+**CLI args for generate.py:** number of nodes, edge probability, directed flag, number of trajectories, max trajectory length, train/val/test split ratios, output directory, random seed.
 
 
 ## 2. Training Pipeline — PyTorch Lightning + HuggingFace Tokenizer
@@ -56,6 +56,7 @@ Use hydra to deal with the configs of the project. Each run will be associated w
 Data:
 - Total number of nodes 
 - connectivity of the Erdos-Renyi graph 
+- directed: whether to generate a directed or undirected graph (default: false)
 - max path-length in the training data 
 - sampling probability for an edge p
 

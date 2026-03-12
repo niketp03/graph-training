@@ -13,33 +13,51 @@ from pathlib import Path
 import networkx as nx
 import hydra
 from omegaconf import DictConfig
+from tqdm import tqdm
 
 SPECIAL_TOKENS = ["<pad>", "<eos>", "<start_goal>", "<end_goal>", "<unk>"]
 
 
-def generate_graph(num_nodes: int, edge_probability: float, seed: int) -> nx.Graph:
-    """Generate an Erdos-Renyi graph and prune to the largest connected component."""
-    graph = nx.erdos_renyi_graph(num_nodes, edge_probability, seed=seed)
+def generate_graph(
+    num_nodes: int,
+    edge_probability: float,
+    seed: int,
+    directed: bool = False,
+) -> nx.Graph:
+    """Generate an Erdos-Renyi graph and prune to the largest connected component.
 
-    # Keep only the largest connected component
-    largest_cc = max(nx.connected_components(graph), key=len)
+    For undirected graphs, keeps the largest connected component.
+    For directed graphs, keeps the largest weakly connected component
+    (i.e. connected when edge direction is ignored).
+    """
+    graph = nx.erdos_renyi_graph(num_nodes, edge_probability, seed=seed, directed=directed)
+
+    if directed:
+        largest_cc = max(nx.weakly_connected_components(graph), key=len)
+    else:
+        largest_cc = max(nx.connected_components(graph), key=len)
     graph = graph.subgraph(largest_cc).copy()
 
-    # Relabel nodes to consecutive integers starting from 0
     mapping = {old: new for new, old in enumerate(sorted(graph.nodes()))}
     graph = nx.relabel_nodes(graph, mapping)
 
-    print(f"Graph: {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges "
+    kind = "directed" if directed else "undirected"
+    print(f"Graph ({kind}): {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges "
           f"(pruned from {num_nodes} nodes)")
     return graph
 
 
 def save_graph(graph: nx.Graph, output_dir: str) -> None:
-    """Save graph structure as JSON with nodes and adjacency lists."""
+    """Save graph structure as JSON with nodes, adjacency lists, and directed flag.
+
+    For directed graphs, the adjacency list stores successors (outgoing edges).
+    """
+    directed = graph.is_directed()
     nodes = sorted(graph.nodes())
     adjacency = {str(node): sorted(list(graph.neighbors(node))) for node in nodes}
 
     graph_data = {
+        "directed": directed,
         "nodes": nodes,
         "adjacency": adjacency,
     }
@@ -47,7 +65,7 @@ def save_graph(graph: nx.Graph, output_dir: str) -> None:
     path = Path(output_dir) / "graph.json"
     with open(path, "w") as f:
         json.dump(graph_data, f, indent=2)
-    print(f"Saved graph to {path}")
+    print(f"Saved graph to {path} (directed={directed})")
 
 
 def format_trajectory(path: list[int]) -> str:
@@ -61,62 +79,25 @@ def format_trajectory(path: list[int]) -> str:
     return f"<start_goal> {start} {end} <end_goal> {path_str}"
 
 
-def find_random_path(
+def random_walk(
     graph: nx.Graph,
     start: int,
-    end: int,
-    max_length: int,
+    num_steps: int,
     rng: random.Random,
-) -> list[int] | None:
-    """Find a path from start to end using a biased random walk.
+) -> list[int]:
+    """Perform a pure random walk of up to *num_steps* steps from *start*.
 
-    Uses a random walk biased toward the target node. Falls back to BFS
-    shortest path if the random walk fails to reach the target.
+    For directed graphs (weakly connected component), a node may have no
+    outgoing edges (dead end).  In that case the walk terminates early.
     """
-    # First check if a path exists and is within length limit
-    try:
-        shortest = nx.shortest_path(graph, start, end)
-    except nx.NetworkXNoPath:
-        return None
-
-    if len(shortest) > max_length:
-        return None
-
-    # For short paths or with some probability, just return the shortest path
-    if len(shortest) >= max_length - 1 or rng.random() < 0.3:
-        return shortest
-
-    # Try a random walk with detours for path diversity
     path = [start]
     current = start
-    visited_set = {start}
-    steps = 0
-
-    while current != end and steps < max_length - 1:
+    for _ in range(num_steps):
         neighbors = list(graph.neighbors(current))
         if not neighbors:
             break
-
-        # Bias toward unvisited nodes and toward the target
-        weights = []
-        for n in neighbors:
-            w = 1.0
-            if n == end:
-                w = 5.0  # Strong bias toward target
-            elif n not in visited_set:
-                w = 2.0  # Prefer unvisited nodes
-            weights.append(w)
-
-        next_node = rng.choices(neighbors, weights=weights, k=1)[0]
-        path.append(next_node)
-        visited_set.add(next_node)
-        current = next_node
-        steps += 1
-
-    # If we didn't reach the target, fall back to shortest path
-    if path[-1] != end:
-        return shortest
-
+        current = rng.choice(neighbors)
+        path.append(current)
     return path
 
 
@@ -126,43 +107,33 @@ def generate_trajectories(
     max_path_length: int,
     seed: int,
 ) -> list[str]:
-    """Generate trajectory strings ensuring all nodes are covered at least once."""
+    """Generate trajectories via pure random walks of varying lengths.
+
+    Splits *num_trajectories* evenly across path lengths 1..max_path_length.
+    For each length j, generates m = num_trajectories // max_path_length
+    trajectories by starting at a random node and taking j steps.
+    """
     rng = random.Random(seed)
     nodes = sorted(graph.nodes())
-    trajectories = []
-    uncovered = set(nodes)
+    trajectories: list[str] = []
 
-    # Phase 1: coverage pass — ensure every node appears in at least one trajectory
-    attempts = 0
-    max_attempts = len(nodes) * 10
-    while uncovered and attempts < max_attempts:
-        start = rng.choice(list(uncovered))
-        end = rng.choice(nodes)
-        while end == start:
-            end = rng.choice(nodes)
+    m = num_trajectories // max_path_length
 
-        path = find_random_path(graph, start, end, max_path_length, rng)
-        if path is not None:
+    for j in tqdm(range(1, max_path_length + 1), desc="Path lengths"):
+        for _ in range(m):
+            start = rng.choice(nodes)
+            path = random_walk(graph, start, j, rng)
             trajectories.append(format_trajectory(path))
-            uncovered -= set(path)
-        attempts += 1
 
-    if uncovered:
-        print(f"Warning: {len(uncovered)} nodes could not be covered in trajectories")
+    covered = set()
+    for t in tqdm(trajectories, desc="Computing coverage"):
+        tokens = t.split()
+        goal_end = tokens.index("<end_goal>")
+        covered.update(int(tok) for tok in tokens[goal_end + 1:])
 
-    print(f"Coverage phase: {len(trajectories)} trajectories "
-          f"(covered {len(nodes) - len(uncovered)}/{len(nodes)} nodes)")
-
-    # Phase 2: fill remaining trajectories with random paths
-    while len(trajectories) < num_trajectories:
-        start = rng.choice(nodes)
-        end = rng.choice(nodes)
-        while end == start:
-            end = rng.choice(nodes)
-
-        path = find_random_path(graph, start, end, max_path_length, rng)
-        if path is not None:
-            trajectories.append(format_trajectory(path))
+    print(f"Generated {len(trajectories)} trajectories "
+          f"(m={m} per length, lengths 1..{max_path_length})")
+    print(f"Node coverage: {len(covered)}/{len(nodes)} nodes")
 
     return trajectories
 
@@ -211,7 +182,7 @@ def split_and_save(
     for filename, data in splits.items():
         filepath = output_path / filename
         with open(filepath, "w") as f:
-            for line in data:
+            for line in tqdm(data, desc=f"Writing {filename}"):
                 f.write(line + "\n")
         print(f"Saved {len(data)} trajectories to {filepath}")
 
@@ -227,6 +198,7 @@ def main(cfg: DictConfig) -> None:
         num_nodes=cfg.data.num_nodes,
         edge_probability=cfg.data.edge_probability,
         seed=cfg.data.seed,
+        directed=cfg.data.get("directed", False),
     )
     save_graph(graph, output_dir)
 

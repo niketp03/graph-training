@@ -7,6 +7,7 @@ checkpoints/
 # Data outputs
 data_output/
 data_output_large/
+data_output_*
 
 # Wandb
 wandb/

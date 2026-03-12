@@ -1,12 +1,13 @@
 data:
   num_nodes: 10000
-  edge_probability: 0.1
+  edge_probability: 0.0001
+  directed: true
   num_trajectories: 100000
-  max_path_length: 50
+  max_path_length: 10
   train_ratio: 0.8
   val_ratio: 0.1
   test_ratio: 0.1
-  output_dir: "./data_output_large"
+  output_dir: "./data_output_large_critical_rw_directed_2"
   seed: 42
 
 model:
@@ -32,10 +33,10 @@ train:
   gradient_accumulation: 1
   gradient_clip_val: 1.0
   precision: "bf16-mixed"
-  num_workers: 4
+  num_workers: 2
   accelerator: "auto"
   devices: "auto"
-  wandb_project: "graph-training-large"
+  wandb_project: "graph-training-large-2-directed"
   wandb_run_name: null
   checkpoint_dir: "./checkpoints"
   val_check_interval: 1.0
