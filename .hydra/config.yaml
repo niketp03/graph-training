@@ -9,6 +9,7 @@ data:
   test_ratio: 0.1
   output_dir: ./data_output_large_critical_rw_directed_2
   seed: 42
+  remove_non_connected: true
 model:
   hidden_size: 896
   num_hidden_layers: 24
@@ -38,3 +39,35 @@ train:
   wandb_run_name: null
   checkpoint_dir: ./checkpoints
   val_check_interval: 1.0
+postrain:
+  algorithm: reinforce
+  checkpoint_path: checkpoints/last-v7.ckpt
+  sampling_algorithm: uniform_connected
+  n_max: 20
+  num_pairs_per_step: 256
+  group_size: 4
+  max_new_tokens: 64
+  temperature: 1.0
+  top_k: 0
+  top_p: 1.0
+  lr: 0.0001
+  weight_decay: 0.01
+  warmup_steps: 100
+  max_steps: 10000
+  gradient_clip_val: 1.0
+  kl_coeff: 0.01
+  clip_range: 0.2
+  num_ppo_epochs: 1
+  baseline: none
+  correct_reward: 1.0
+  incorrect_reward: 0.0
+  wandb_project: graph-postrain-uniform-all-connected
+  wandb_run_name: null
+  checkpoint_dir: ./postrain_checkpoints-uniform-all-connected
+  save_every_steps: 500
+  log_every_steps: 10
+  eval_every_steps: 100
+  eval_num_pairs: 256
+  precision: bf16-mixed
+  seed: 42
+  resume_from: null

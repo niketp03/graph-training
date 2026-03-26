@@ -9,6 +9,7 @@ data:
   test_ratio: 0.1
   output_dir: "./data_output_large_critical_rw_directed_2"
   seed: 42
+  remove_non_connected: True
 
 model:
   hidden_size: 896
@@ -40,6 +41,55 @@ train:
   wandb_run_name: null
   checkpoint_dir: "./checkpoints"
   val_check_interval: 1.0
+
+postrain:
+  algorithm: "reinforce"            # "grpo" or "reinforce"
+  checkpoint_path: "checkpoints/last-v7.ckpt"        # path to a supervised-training Lightning checkpoint
+
+  # Sampling
+  sampling_algorithm: "uniform_connected"  # "uniform_pairs" or "uniform_specified" or "uniform_connected" or "teacher_stationary"
+  n_max: 20                   # max path length for uniform_specified sampling
+  num_pairs_per_step: 256     # (u,v) pairs sampled per RL step
+  group_size: 4                # rollouts per pair (GRPO); ignored by REINFORCE
+  max_new_tokens: 64          # max tokens the model may generate per rollout
+  temperature: 1.0
+  top_k: 0                     # 0 = disabled
+  top_p: 1.0
+
+  # Optimiser
+  lr: 1.0e-4
+  weight_decay: 0.01
+  warmup_steps: 100
+  max_steps: 10000
+  gradient_clip_val: 1.0
+
+  # GRPO-specific
+  kl_coeff: 0.01               # weight of KL(pi_theta || pi_ref) penalty
+  clip_range: 0.2              # PPO clipping epsilon
+  num_ppo_epochs: 1            # surrogate-objective epochs per rollout batch
+
+  # REINFORCE-specific
+  baseline: "none"             # "mean" or "none"
+
+  # Rewards
+  correct_reward: 1.0
+  incorrect_reward: 0.0
+
+  # Logging & checkpointing
+  wandb_project: "graph-postrain-uniform-all-connected"
+  wandb_run_name: null
+  checkpoint_dir: "./postrain_checkpoints-uniform-all-connected"
+  save_every_steps: 500
+  log_every_steps: 10
+  eval_every_steps: 100
+  eval_num_pairs: 256
+
+  # Hardware
+  precision: "bf16-mixed"
+  seed: 42
+
+  # Optional: resume from a previous post-training checkpoint
+  resume_from: null
 
 hydra:
   run:

@@ -23,6 +23,7 @@ def generate_graph(
     edge_probability: float,
     seed: int,
     directed: bool = False,
+    remove_non_connected: bool = True,
 ) -> nx.Graph:
     """Generate an Erdos-Renyi graph and prune to the largest connected component.
 
@@ -32,11 +33,12 @@ def generate_graph(
     """
     graph = nx.erdos_renyi_graph(num_nodes, edge_probability, seed=seed, directed=directed)
 
-    if directed:
-        largest_cc = max(nx.weakly_connected_components(graph), key=len)
-    else:
-        largest_cc = max(nx.connected_components(graph), key=len)
-    graph = graph.subgraph(largest_cc).copy()
+    if remove_non_connected:
+        if directed:
+            largest_cc = max(nx.weakly_connected_components(graph), key=len)
+        else:
+            largest_cc = max(nx.connected_components(graph), key=len)
+        graph = graph.subgraph(largest_cc).copy()
 
     mapping = {old: new for new, old in enumerate(sorted(graph.nodes()))}
     graph = nx.relabel_nodes(graph, mapping)
@@ -199,6 +201,7 @@ def main(cfg: DictConfig) -> None:
         edge_probability=cfg.data.edge_probability,
         seed=cfg.data.seed,
         directed=cfg.data.get("directed", False),
+        remove_non_connected=cfg.data.get("remove_non_connected", True),
     )
     save_graph(graph, output_dir)
 
