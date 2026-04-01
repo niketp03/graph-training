@@ -2,12 +2,12 @@ data:
   num_nodes: 10000
   edge_probability: 0.0001
   directed: true
-  num_trajectories: 100000
+  num_trajectories: 1000000
   max_path_length: 10
   train_ratio: 0.8
   val_ratio: 0.1
   test_ratio: 0.1
-  output_dir: "./data_output_large_critical_rw_directed_2"
+  output_dir: "./data_output_more_trajectories"
   seed: 42
   remove_non_connected: True
 
@@ -37,18 +37,18 @@ train:
   num_workers: 2
   accelerator: "auto"
   devices: "auto"
-  wandb_project: "graph-training-large-2-directed"
+  wandb_project: "graph-training-large-2-directed-more-trajectories"
   wandb_run_name: null
   checkpoint_dir: "./checkpoints"
   val_check_interval: 1.0
 
 postrain:
   algorithm: "reinforce"            # "grpo" or "reinforce"
-  checkpoint_path: "checkpoints/last-v7.ckpt"        # path to a supervised-training Lightning checkpoint
+  checkpoint_path: "checkpoints/epoch-epoch=02-val_loss-val/loss=1.5257.ckpt"        # path to a supervised-training Lightning checkpoint
 
   # Sampling
-  sampling_algorithm: "uniform_connected"  # "uniform_pairs" or "uniform_specified" or "uniform_connected" or "teacher_stationary"
-  n_max: 20                   # max path length for uniform_specified sampling
+  sampling_algorithm: "uniform_specified"  # "uniform_pairs" or "uniform_specified" or "uniform_connected" or "teacher_stationary"
+  n_max: 10                   # max path length for uniform_specified sampling
   num_pairs_per_step: 256     # (u,v) pairs sampled per RL step
   group_size: 4                # rollouts per pair (GRPO); ignored by REINFORCE
   max_new_tokens: 64          # max tokens the model may generate per rollout
@@ -76,9 +76,9 @@ postrain:
   incorrect_reward: 0.0
 
   # Logging & checkpointing
-  wandb_project: "graph-postrain-uniform-all-connected"
+  wandb_project: "graph-postrain-uniform-all-connected-more-trajectories"
   wandb_run_name: null
-  checkpoint_dir: "./postrain_checkpoints-uniform-all-connected"
+  checkpoint_dir: "./postrain_checkpoints-uniform-all-connected-more-trajectories"
   save_every_steps: 500
   log_every_steps: 10
   eval_every_steps: 100

@@ -80,21 +80,15 @@ class TeacherModel:
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def sample_tasks(
+    def _generate_pairs_batch(
         self,
-        num_tasks: int,
-        temperature: float = 1.0,
-        top_k: int = 0,
-        top_p: float = 1.0,
-    ) -> list[tuple[int, int]]:
-        """Sample ``num_tasks`` (start, end) node pairs from the teacher.
-
-        Feeds ``<start_goal>`` as the prompt and generates exactly 2 tokens.
-        Each generated pair of tokens is decoded and parsed into integer node
-        IDs.
-        """
-        prompt = "<start_goal>"
-        prompt_strings = [prompt] * num_tasks
+        batch_size: int,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+    ) -> list[tuple[int, int] | None]:
+        """Generate a single batch and return pairs (None for failed decodes)."""
+        prompt_strings = ["<start_goal>"] * batch_size
 
         orig_side = self.tokenizer.padding_side
         self.tokenizer.padding_side = "left"
@@ -120,8 +114,8 @@ class TeacherModel:
         )
 
         prompt_len = enc.input_ids.shape[1]
-        pairs: list[tuple[int, int]] = []
-        for i in range(num_tasks):
+        pairs: list[tuple[int, int] | None] = []
+        for i in range(batch_size):
             new_tokens = generated_ids[i, prompt_len:].tolist()
             try:
                 node_strs = [
@@ -133,8 +127,36 @@ class TeacherModel:
                     pairs.append(None)
             except (ValueError, KeyError):
                 pairs.append(None)
-
         return pairs
+
+    @torch.no_grad()
+    def sample_tasks(
+        self,
+        num_tasks: int,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        max_retries: int = 10,
+    ) -> list[tuple[int, int]]:
+        """Sample ``num_tasks`` valid (start, end) node pairs from the teacher.
+
+        Retries up to ``max_retries`` times to fill any slots where the model
+        produced un-parseable outputs.  Returns exactly ``num_tasks`` pairs or
+        fewer only if all retries are exhausted.
+        """
+        collected: list[tuple[int, int]] = []
+        remaining = num_tasks
+
+        for attempt in range(max_retries):
+            batch = self._generate_pairs_batch(
+                remaining, temperature, top_k, top_p,
+            )
+            collected.extend(p for p in batch if p is not None)
+            remaining = num_tasks - len(collected)
+            if remaining <= 0:
+                break
+
+        return collected[:num_tasks]
 
     # ------------------------------------------------------------------
     # Policy-gradient update

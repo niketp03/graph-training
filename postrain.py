@@ -122,7 +122,7 @@ class TeacherEnvironment:
         self.teacher_model = teacher_model
 
     def sample_pairs(self, n: int, rng: random.Random) -> list[tuple[int, int]]:
-        return self.teacher_model.sample_tasks(n, rng)
+        return self.teacher_model.sample_tasks(n)
 
 # ---------------------------------------------------------------------------
 # Generation helpers
@@ -547,8 +547,14 @@ def main(cfg: DictConfig) -> None:
             pairs = env.sample_pairs_connected(pc.num_pairs_per_step, rng)
         elif sampling == "teacher_stationary":
             pairs = teacher_env.sample_pairs(pc.num_pairs_per_step, rng)
+            
         else:
             raise ValueError(f"Unknown sampling_algorithm: {sampling}")
+
+        # drop None entries (failed decodes from teacher sampling)
+        pairs = [p for p in pairs if p is not None]
+        if len(pairs) == 0:
+            continue
 
         # for GRPO, repeat each pair group_size times
         if pc.algorithm == "grpo":
