@@ -30,11 +30,8 @@ class TrajectoryDataset(Dataset):
     def __getitem__(self, idx: int) -> dict:
         line = self.lines[idx]
 
-        # Append <eos> to the trajectory string before tokenizing
-        line_with_eos = line + " " + self.tokenizer.eos_token
-
         encoding = self.tokenizer(
-            line_with_eos,
+            line,
             truncation=True,
             max_length=self.max_length,
             padding=False,
