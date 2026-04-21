@@ -1,6 +1,8 @@
 """Training entrypoint for graph trajectory next-token prediction."""
 
+import json
 import os
+from datetime import datetime
 from pathlib import Path
 
 import hydra
@@ -12,6 +14,38 @@ from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 from data import TrajectoryDataModule
 from model import GraphTrajectoryLM
 from tokenizer_utils import build_tokenizer, save_tokenizer, load_tokenizer
+
+
+class MetadataCallback(pl.Callback):
+    """Embeds samples_seen into each checkpoint and writes metadata.json on train end."""
+
+    def __init__(self, run_dir: Path, cfg: DictConfig):
+        self.run_dir = run_dir
+        self.cfg = cfg
+
+    def on_save_checkpoint(self, trainer, pl_module, checkpoint):
+        checkpoint["samples_seen"] = (
+            trainer.global_step
+            * self.cfg.train.batch_size
+            * self.cfg.train.gradient_accumulation
+        )
+        checkpoint["max_path_length"] = self.cfg.data.max_path_length
+
+    def on_train_end(self, trainer, pl_module):
+        metadata = {
+            "max_path_length": self.cfg.data.max_path_length,
+            "samples_seen": (
+                trainer.global_step
+                * self.cfg.train.batch_size
+                * self.cfg.train.gradient_accumulation
+            ),
+            "global_step": trainer.global_step,
+            "batch_size": self.cfg.train.batch_size,
+            "gradient_accumulation": self.cfg.train.gradient_accumulation,
+        }
+        with open(self.run_dir / "metadata.json", "w") as f:
+            json.dump(metadata, f, indent=2)
+        print(f"Metadata written to {self.run_dir / 'metadata.json'}")
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="config")
@@ -41,6 +75,15 @@ def main(cfg: DictConfig) -> None:
     print(f"Vocabulary size: {vocab_size}")
     print(f"Pad token ID: {pad_token_id}, EOS token ID: {eos_token_id}")
 
+    # Unique run directory — one per run, under the configured checkpoint base dir
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = Path(cfg.train.checkpoint_dir) / f"run_{run_id}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save the config that produced this run
+    OmegaConf.save(cfg, run_dir / "config.yaml")
+    print(f"Run checkpoint dir: {run_dir}")
+
     # DataModule
     datamodule = TrajectoryDataModule(
         data_dir=data_dir,
@@ -67,16 +110,17 @@ def main(cfg: DictConfig) -> None:
         config=OmegaConf.to_container(cfg, resolve=True),
     )
 
-    # Callbacks
+    # Callbacks — save only the single best checkpoint for this run
     checkpoint_callback = ModelCheckpoint(
-        dirpath=cfg.train.checkpoint_dir,
-        filename="epoch-{epoch:02d}-val_loss-{val/loss:.4f}",
+        dirpath=run_dir,
+        filename="best",
         monitor="val/loss",
         mode="min",
-        save_top_k=3,
-        save_last=True,
+        save_top_k=1,
+        save_last=False,
     )
     lr_monitor = LearningRateMonitor(logging_interval="step")
+    metadata_cb = MetadataCallback(run_dir, cfg)
 
     # Trainer
     trainer = pl.Trainer(
@@ -87,7 +131,7 @@ def main(cfg: DictConfig) -> None:
         accumulate_grad_batches=cfg.train.gradient_accumulation,
         gradient_clip_val=cfg.train.gradient_clip_val,
         logger=wandb_logger,
-        callbacks=[checkpoint_callback, lr_monitor],
+        callbacks=[checkpoint_callback, lr_monitor, metadata_cb],
         val_check_interval=cfg.train.val_check_interval,
         log_every_n_steps=10,
     )

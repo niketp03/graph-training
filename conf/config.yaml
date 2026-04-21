@@ -30,7 +30,7 @@ train:
   weight_decay: 0.01
   warmup_steps: 100
   max_epochs: 10
-  batch_size: 32
+  batch_size: 256
   gradient_accumulation: 1
   gradient_clip_val: 1.0
   precision: "bf16-mixed"
@@ -75,6 +75,10 @@ postrain:
   correct_reward: 1.0
   incorrect_reward: 0.0
 
+  # Mixed training: fraction of steps that use SFT on pretrain data
+  # 0.0 = pure RL, 1.0 = pure SFT, 0.3 = 30% SFT + 70% RL
+  proportion: 0.0
+
   # Logging & checkpointing
   wandb_project: "graph-postrain-uniform-all-connected-more-trajectories"
   wandb_run_name: null
@@ -93,6 +97,6 @@ postrain:
 
 hydra:
   run:
-    dir: "."
+    dir: "outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}"
   job:
     chdir: false

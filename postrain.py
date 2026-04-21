@@ -11,6 +11,7 @@ import copy
 import json
 import os
 import random
+from datetime import datetime
 from pathlib import Path
 
 import hydra
@@ -20,9 +21,11 @@ import torch.nn.functional as F
 import wandb
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
+from transformers import StoppingCriteria, StoppingCriteriaList
 
+from data import TrajectoryDataset
 from model import GraphTrajectoryLM
-from tokenizer_utils import load_tokenizer  
+from tokenizer_utils import load_tokenizer
 from teacher import TeacherModel
 
 class GraphEnvironment:
@@ -128,6 +131,30 @@ class TeacherEnvironment:
 # Generation helpers
 # ---------------------------------------------------------------------------
 
+class GoalTokenStoppingCriteria(StoppingCriteria):
+    """Stop each sequence individually as soon as it emits its goal token."""
+
+    def __init__(self, goal_token_ids: list[int]):
+        self.goal_token_ids = goal_token_ids
+        self.stopped = [False] * len(goal_token_ids)
+
+    def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor, **kwargs) -> bool:
+        for i, goal_id in enumerate(self.goal_token_ids):
+            if not self.stopped[i] and input_ids[i, -1].item() == goal_id:
+                self.stopped[i] = True
+        return all(self.stopped)
+
+
+def get_goal_token_ids(pairs: list[tuple[int, int]], tokenizer) -> list[int]:
+    """Return the single token ID corresponding to each goal node v."""
+    ids = []
+    for _, v in pairs:
+        encoded = tokenizer.encode(str(v), add_special_tokens=False)
+        assert len(encoded) == 1, f"Node {v} encodes to {len(encoded)} tokens — expected 1"
+        ids.append(encoded[0])
+    return ids
+
+
 def build_prompt_strings(pairs: list[tuple[int, int]]) -> list[str]:
     return [f"<start_goal> {u} {v} <end_goal>" for u, v in pairs]
 
@@ -137,6 +164,7 @@ def generate_rollouts(
     model,
     tokenizer,
     prompt_strings: list[str],
+    goal_token_ids: list[int],
     max_new_tokens: int,
     temperature: float,
     top_k: int,
@@ -145,6 +173,7 @@ def generate_rollouts(
 ) -> tuple[torch.Tensor, int]:
     """Generate completions for a batch of prompts.
 
+    Stops each sequence individually when it emits its per-sequence goal token.
     Returns (generated_ids [B, T], prompt_len) where prompt_len is the
     padded prompt length (identical for every row thanks to left-padding).
     """
@@ -156,6 +185,10 @@ def generate_rollouts(
     ).to(device)
     prompt_len = encodings.input_ids.shape[1]
 
+    stopping_criteria = StoppingCriteriaList(
+        [GoalTokenStoppingCriteria(goal_token_ids)]
+    )
+
     gen_kwargs: dict = dict(
         max_new_tokens=max_new_tokens,
         do_sample=True,
@@ -163,7 +196,8 @@ def generate_rollouts(
         top_p=top_p,
         top_k=top_k if top_k > 0 else None,
         pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
+        eos_token_id=None,
+        stopping_criteria=stopping_criteria,
     )
 
     generated_ids = model.generate(
@@ -202,12 +236,8 @@ def parse_and_verify(
         start, end = pairs[i]
         response_ids = generated_ids[i, prompt_len:].tolist()
 
-        clean_ids: list[int] = []
-        for tid in response_ids:
-            if tid in (eos_id, pad_id):
-                break
-            clean_ids.append(tid)
-
+        # Strip pad tokens; no EOS stopping — model runs to max_new_tokens
+        clean_ids = [tid for tid in response_ids if tid != pad_id]
         total_gen_len += len(clean_ids)
 
         try:
@@ -215,12 +245,17 @@ def parse_and_verify(
         except (ValueError, KeyError):
             continue
 
-        if path_nodes and path_nodes[-1] == end:
+        # Find the first occurrence of the goal node; truncate there
+        try:
+            end_idx = path_nodes.index(end)
             num_reached_end += 1
-
-        if env.verify_path(start, end, path_nodes):
-            rewards[i] = correct_reward
-            num_valid += 1
+            path_prefix = path_nodes[: end_idx + 1]
+            if env.verify_path(start, end, path_prefix):
+                rewards[i] = correct_reward
+                num_valid += 1
+        except ValueError:
+            # goal node not reached within max_new_tokens → reward = 0
+            pass
 
     info = {
         "accuracy": num_valid / B if B > 0 else 0.0,
@@ -399,6 +434,10 @@ def evaluate(
     for start in range(0, len(pairs), batch_size):
         bp = pairs[start : start + batch_size]
         prompts = build_prompt_strings(bp)
+        goal_ids = get_goal_token_ids(bp, tokenizer)
+        stopping_criteria = StoppingCriteriaList(
+            [GoalTokenStoppingCriteria(goal_ids)]
+        )
 
         orig_side = tokenizer.padding_side
         tokenizer.padding_side = "left"
@@ -410,7 +449,8 @@ def evaluate(
             max_new_tokens=max_new_tokens,
             do_sample=False,
             pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
+            eos_token_id=None,
+            stopping_criteria=stopping_criteria,
         )
         tokenizer.padding_side = orig_side
 
@@ -429,10 +469,45 @@ def evaluate(
 
 
 # ---------------------------------------------------------------------------
+# Pretraining SFT step (used when proportion > 0)
+# ---------------------------------------------------------------------------
+
+def pretrain_step(
+    model,
+    optimizer,
+    batch: dict,
+    gradient_clip_val: float,
+    device: torch.device,
+) -> dict:
+    """One supervised cross-entropy step on a batch from the pretrain dataset."""
+    input_ids = batch["input_ids"].to(device)
+    attention_mask = batch["attention_mask"].to(device)
+    labels = batch["labels"].to(device)
+
+    out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+    loss = out.loss
+
+    optimizer.zero_grad()
+    loss.backward()
+    if gradient_clip_val > 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_val)
+    optimizer.step()
+
+    return {"loss": loss.item()}
+
+
+def _infinite_loader(dataloader):
+    """Yield batches from a DataLoader indefinitely."""
+    while True:
+        yield from dataloader
+
+
+# ---------------------------------------------------------------------------
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
 
-def save_checkpoint(path: Path, step: int, model, optimizer, scheduler, cfg):
+def save_checkpoint(path: Path, step: int, model, optimizer, scheduler, cfg,
+                    pretrain_samples_seen: int = 0):
     torch.save(
         {
             "step": step,
@@ -440,6 +515,11 @@ def save_checkpoint(path: Path, step: int, model, optimizer, scheduler, cfg):
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "config": OmegaConf.to_container(cfg, resolve=True),
+            "pretrain_samples_seen": pretrain_samples_seen,
+            "posttrain_samples_seen": step * cfg.postrain.num_pairs_per_step,
+            "total_samples_seen": pretrain_samples_seen + step * cfg.postrain.num_pairs_per_step,
+            "n_max": cfg.postrain.n_max,
+            "max_path_length": cfg.data.max_path_length,
         },
         path,
     )
@@ -466,7 +546,15 @@ def main(cfg: DictConfig) -> None:
     random.seed(pc.seed)
     torch.manual_seed(pc.seed)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.device_count()  # triggers full CUDA init; catches MPS daemon errors early
+            device = torch.device("cuda")
+        except RuntimeError as e:
+            print(f"WARNING: CUDA reported available but init failed ({e}); falling back to CPU")
+            device = torch.device("cpu")
+    else:
+        device = torch.device("cpu")
     dtype = torch.bfloat16 if "bf16" in pc.precision else torch.float32
 
     # ---- tokenizer & graph --------------------------------------------------
@@ -511,9 +599,17 @@ def main(cfg: DictConfig) -> None:
         )
         print(f"Resumed from step {start_step}")
 
-    # ---- checkpoint dir -----------------------------------------------------
-    ckpt_dir = Path(pc.checkpoint_dir)
+    # ---- checkpoint dir: one unique dir per run -----------------------------
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ckpt_dir = Path(pc.checkpoint_dir) / f"run_{run_id}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    OmegaConf.save(cfg, ckpt_dir / "config.yaml")
+    print(f"Postrain run dir: {ckpt_dir}")
+
+    # Read how many samples the pretrain checkpoint had seen
+    _pretrain_ckpt_raw = torch.load(pc.checkpoint_path, map_location="cpu", weights_only=False)
+    pretrain_samples_seen: int = _pretrain_ckpt_raw.get("samples_seen", 0)
+    del _pretrain_ckpt_raw
 
     # ---- W&B ----------------------------------------------------------------
     wandb.init(
@@ -525,8 +621,54 @@ def main(cfg: DictConfig) -> None:
     rng = random.Random(pc.seed)
     eval_rng = random.Random(pc.seed + 1)
 
+    # ---- pretrain DataLoader (used when proportion > 0) ---------------------
+    proportion = pc.get("proportion", 0.0)
+    pretrain_iter = None
+    if proportion > 0.0:
+        pretrain_dataset = TrajectoryDataset(
+            file_path=os.path.join(data_dir, "train.txt"),
+            tokenizer=tokenizer,
+            max_length=pc.get("max_new_tokens", 128) + 16,  # generous cap
+        )
+        from torch.utils.data import DataLoader as _DL
+        from data import TrajectoryDataModule as _DM  # for collate_fn
+
+        # Build a minimal collate_fn using the same padding logic as TrajectoryDataModule
+        pad_id = tokenizer.pad_token_id
+
+        def _collate(batch):
+            all_ids = [item["input_ids"] for item in batch]
+            max_len = max(len(ids) for ids in all_ids)
+            inp, lbl, masks = [], [], []
+            for ids in all_ids:
+                pad = max_len - len(ids)
+                masks.append([1] * len(ids) + [0] * pad)
+                inp.append(ids + [pad_id] * pad)
+                lbl.append(ids + [-100] * pad)
+            return {
+                "input_ids": torch.tensor(inp, dtype=torch.long),
+                "attention_mask": torch.tensor(masks, dtype=torch.long),
+                "labels": torch.tensor(lbl, dtype=torch.long),
+            }
+
+        pretrain_loader = _DL(
+            pretrain_dataset,
+            batch_size=pc.num_pairs_per_step,
+            shuffle=True,
+            num_workers=2,
+            collate_fn=_collate,
+            pin_memory=True,
+        )
+        pretrain_iter = _infinite_loader(pretrain_loader)
+        print(f"Pretrain dataset loaded: {len(pretrain_dataset):,} trajectories")
+
+    print(
+        f"proportion={proportion:.2f} "
+        f"({'mixed SFT+RL' if 0 < proportion < 1 else 'pure SFT' if proportion >= 1 else 'pure RL'})"
+    )
+
     # ---- training loop ------------------------------------------------------
-    sampling_algo = pc.get("sampling_algorithm", "uniform_pairs") # or "uniform_connected" or "uniform_specified"
+    sampling_algo = pc.get("sampling_algorithm", "uniform_pairs")
     print(
         f"Starting RLVR post-training — algorithm={pc.algorithm.upper()}, "
         f"sampling={sampling_algo}"
@@ -535,111 +677,123 @@ def main(cfg: DictConfig) -> None:
     for step in tqdm(range(start_step + 1, pc.max_steps + 1), desc="Post-train"):
         model.train()
 
-        # 1) sample (u, v) pairs
-        sampling = pc.get("sampling_algorithm", "uniform_pairs")
-        if sampling == "uniform_pairs":
-            pairs = env.sample_pairs(pc.num_pairs_per_step, rng)
-        elif sampling == "uniform_specified":
-            pairs = env.sample_specified_pairs(
-                pc.num_pairs_per_step, pc.n_max, rng
+        # Decide this step's training mode based on proportion.
+        # proportion = fraction of steps that use SFT on pretraining data;
+        # (1 - proportion) = fraction of steps that use RL.
+        use_sft = (pretrain_iter is not None) and (rng.random() < proportion)
+
+        if use_sft:
+            # ---- SFT step on pretraining data --------------------------------
+            batch = next(pretrain_iter)
+            step_info = pretrain_step(
+                model, optimizer, batch, pc.gradient_clip_val, device
             )
-        elif sampling == "uniform_connected":
-            pairs = env.sample_pairs_connected(pc.num_pairs_per_step, rng)
-        elif sampling == "teacher_stationary":
-            pairs = teacher_env.sample_pairs(pc.num_pairs_per_step, rng)
-            
+            scheduler.step()
+
+            if step % pc.log_every_steps == 0:
+                log_data = {
+                    "step": step,
+                    "train/sft_loss": step_info["loss"],
+                    "train/lr": scheduler.get_last_lr()[0],
+                    "train/step_type": 0,  # 0 = SFT
+                }
+                wandb.log(log_data, step=step)
+                tqdm.write(f"[Step {step}] SFT loss={step_info['loss']:.4f}")
+
         else:
-            raise ValueError(f"Unknown sampling_algorithm: {sampling}")
+            # ---- RL step -----------------------------------------------------
+            # 1) sample (u, v) pairs
+            sampling = pc.get("sampling_algorithm", "uniform_pairs")
+            if sampling == "uniform_pairs":
+                pairs = env.sample_pairs(pc.num_pairs_per_step, rng)
+            elif sampling == "uniform_specified":
+                pairs = env.sample_specified_pairs(
+                    pc.num_pairs_per_step, pc.n_max, rng
+                )
+            elif sampling == "uniform_connected":
+                pairs = env.sample_pairs_connected(pc.num_pairs_per_step, rng)
+            elif sampling == "teacher_stationary":
+                pairs = teacher_env.sample_pairs(pc.num_pairs_per_step, rng)
+            else:
+                raise ValueError(f"Unknown sampling_algorithm: {sampling}")
 
-        # drop None entries (failed decodes from teacher sampling)
-        pairs = [p for p in pairs if p is not None]
-        if len(pairs) == 0:
-            continue
+            pairs = [p for p in pairs if p is not None]
+            if len(pairs) == 0:
+                continue
 
-        # for GRPO, repeat each pair group_size times
-        if pc.algorithm == "grpo":
-            gen_pairs = [p for p in pairs for _ in range(pc.group_size)]
-        else:
-            gen_pairs = pairs
+            # for GRPO, repeat each pair group_size times
+            gen_pairs = [p for p in pairs for _ in range(pc.group_size)] \
+                if pc.algorithm == "grpo" else pairs
 
-        # 2) generate rollouts
-        generated_ids, prompt_len = generate_rollouts(
-            model=model,
-            tokenizer=tokenizer,
-            prompt_strings=build_prompt_strings(gen_pairs),
-            max_new_tokens=pc.max_new_tokens,
-            temperature=pc.temperature,
-            top_k=pc.get("top_k", 0),
-            top_p=pc.get("top_p", 1.0),
-            device=device,
-        )
+            # 2) generate rollouts
+            generated_ids, prompt_len = generate_rollouts(
+                model=model,
+                tokenizer=tokenizer,
+                prompt_strings=build_prompt_strings(gen_pairs),
+                goal_token_ids=get_goal_token_ids(gen_pairs, tokenizer),
+                max_new_tokens=pc.max_new_tokens,
+                temperature=pc.temperature,
+                top_k=pc.get("top_k", 0),
+                top_p=pc.get("top_p", 1.0),
+                device=device,
+            )
 
-        # 3) verify & reward
-        rewards, gen_info = parse_and_verify(
-            generated_ids,
-            prompt_len,
-            gen_pairs,
-            tokenizer,
-            env,
-            correct_reward=pc.correct_reward,
-            incorrect_reward=pc.incorrect_reward,
-        )
-
-        # 4) masks
-        attn_mask = (generated_ids != tokenizer.pad_token_id).long()
-        resp_mask = get_response_mask(generated_ids, prompt_len, tokenizer.pad_token_id)
-
-        # 5) policy-gradient update
-        if pc.algorithm == "reinforce":
-            step_info = reinforce_step(
-                model,
-                optimizer,
+            # 3) verify & reward
+            rewards, gen_info = parse_and_verify(
                 generated_ids,
-                attn_mask,
-                rewards,
-                resp_mask,
-                baseline=pc.baseline,
-                gradient_clip_val=pc.gradient_clip_val,
+                prompt_len,
+                gen_pairs,
+                tokenizer,
+                env,
+                correct_reward=pc.correct_reward,
+                incorrect_reward=pc.incorrect_reward,
             )
-        elif pc.algorithm == "grpo":
-            step_info = grpo_step(
-                model,
-                ref_model,
-                optimizer,
-                generated_ids,
-                attn_mask,
-                rewards,
-                resp_mask,
-                group_size=pc.group_size,
-                clip_range=pc.clip_range,
-                kl_coeff=pc.kl_coeff,
-                num_ppo_epochs=pc.get("num_ppo_epochs", 1),
-                gradient_clip_val=pc.gradient_clip_val,
-            )
-        else:
-            raise ValueError(f"Unknown algorithm: {pc.algorithm}")
 
-        scheduler.step()
+            # 4) masks
+            attn_mask = (generated_ids != tokenizer.pad_token_id).long()
+            resp_mask = get_response_mask(generated_ids, prompt_len, tokenizer.pad_token_id)
 
-        # 6) logging
-        if step % pc.log_every_steps == 0:
-            log_data = {
-                "step": step,
-                "train/loss": step_info["loss"],
-                "train/accuracy": gen_info["accuracy"],
-                "train/avg_gen_length": gen_info["avg_gen_length"],
-                "train/mean_reward": rewards.mean().item(),
-                "train/lr": scheduler.get_last_lr()[0],
-            }
-            for k in ("policy_loss", "kl_loss", "mean_advantage", "mean_group_std"):
-                if k in step_info:
-                    log_data[f"train/{k}"] = step_info[k]
-            wandb.log(log_data, step=step)
-            tqdm.write(
-                f"[Step {step}] loss={step_info['loss']:.4f} "
-                f"acc={gen_info['accuracy']:.3f} "
-                f"reward={rewards.mean():.3f}"
-            )
+            # 5) policy-gradient update
+            if pc.algorithm == "reinforce":
+                step_info = reinforce_step(
+                    model, optimizer, generated_ids, attn_mask, rewards, resp_mask,
+                    baseline=pc.baseline,
+                    gradient_clip_val=pc.gradient_clip_val,
+                )
+            elif pc.algorithm == "grpo":
+                step_info = grpo_step(
+                    model, ref_model, optimizer, generated_ids, attn_mask, rewards, resp_mask,
+                    group_size=pc.group_size,
+                    clip_range=pc.clip_range,
+                    kl_coeff=pc.kl_coeff,
+                    num_ppo_epochs=pc.get("num_ppo_epochs", 1),
+                    gradient_clip_val=pc.gradient_clip_val,
+                )
+            else:
+                raise ValueError(f"Unknown algorithm: {pc.algorithm}")
+
+            scheduler.step()
+
+            # 6) logging
+            if step % pc.log_every_steps == 0:
+                log_data = {
+                    "step": step,
+                    "train/loss": step_info["loss"],
+                    "train/accuracy": gen_info["accuracy"],
+                    "train/avg_gen_length": gen_info["avg_gen_length"],
+                    "train/mean_reward": rewards.mean().item(),
+                    "train/lr": scheduler.get_last_lr()[0],
+                    "train/step_type": 1,  # 1 = RL
+                }
+                for k in ("policy_loss", "kl_loss", "mean_advantage", "mean_group_std"):
+                    if k in step_info:
+                        log_data[f"train/{k}"] = step_info[k]
+                wandb.log(log_data, step=step)
+                tqdm.write(
+                    f"[Step {step}] RL loss={step_info['loss']:.4f} "
+                    f"acc={gen_info['accuracy']:.3f} "
+                    f"reward={rewards.mean():.3f}"
+                )
 
         # 7) evaluation
         if step % pc.eval_every_steps == 0:
@@ -657,16 +811,33 @@ def main(cfg: DictConfig) -> None:
                 f"[Eval @ {step}] accuracy={eval_info['eval/accuracy']:.3f}"
             )
 
-        # 8) checkpoint
+        # 8) checkpoint (intermediate saves are kept for resumption only)
         if step % pc.save_every_steps == 0:
             p = ckpt_dir / f"postrain_step_{step}.pt"
-            save_checkpoint(p, step, model, optimizer, scheduler, cfg)
+            save_checkpoint(p, step, model, optimizer, scheduler, cfg,
+                            pretrain_samples_seen=pretrain_samples_seen)
             tqdm.write(f"Checkpoint → {p}")
 
-    # ---- final save ---------------------------------------------------------
+    # ---- final save (canonical single checkpoint for this run) --------------
     final = ckpt_dir / "postrain_final.pt"
-    save_checkpoint(final, pc.max_steps, model, optimizer, scheduler, cfg)
+    save_checkpoint(final, pc.max_steps, model, optimizer, scheduler, cfg,
+                    pretrain_samples_seen=pretrain_samples_seen)
     print(f"Final checkpoint → {final}")
+
+    # Write human-readable metadata for eval matching
+    metadata = {
+        "n_max": pc.n_max,
+        "max_path_length": cfg.data.max_path_length,
+        "pretrain_checkpoint": pc.checkpoint_path,
+        "pretrain_samples_seen": pretrain_samples_seen,
+        "posttrain_samples_seen": pc.max_steps * pc.num_pairs_per_step,
+        "total_samples_seen": pretrain_samples_seen + pc.max_steps * pc.num_pairs_per_step,
+        "max_steps": pc.max_steps,
+        "num_pairs_per_step": pc.num_pairs_per_step,
+    }
+    with open(ckpt_dir / "metadata.json", "w") as f:
+        json.dump(metadata, f, indent=2)
+    print(f"Metadata written to {ckpt_dir / 'metadata.json'}")
 
     wandb.finish()
 
